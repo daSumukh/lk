@@ -1,4 +1,13 @@
 /*
+
+Lines which I commented out to get to this output
+676-678 Ignoring the new==old
+842 Ignoring thread->magic == THREAD_MAGIC
+101 Ignoring thread->magic == THREAD_MAGIC
+
+*/
+
+/*
  * Copyright (c) 2008-2015 Travis Geiselbrecht
  *
  * Use of this source code is governed by a MIT-style
@@ -68,6 +77,7 @@ static thread_t _idle_thread;
 
 /* local routines */
 static void thread_resched(void);
+static void thread_resched_2(thread_t *current_thread); // predeclaration of thread_resched_2
 static void idle_thread_routine(void) __NO_RETURN;
 
 #if PLATFORM_HAS_DYNAMIC_TIMER
@@ -88,7 +98,7 @@ static void insert_in_run_queue_head(thread_t *t) {
 }
 
 static void insert_in_run_queue_tail(thread_t *t) {
-    DEBUG_ASSERT(t->magic == THREAD_MAGIC);
+    // DEBUG_ASSERT(t->magic == THREAD_MAGIC);
     DEBUG_ASSERT(t->state == THREAD_READY);
     DEBUG_ASSERT(!list_in_list(&t->queue_node));
     DEBUG_ASSERT(arch_ints_disabled());
@@ -396,6 +406,7 @@ void thread_exit(int retcode) {
 
     /* if we're detached, then do our teardown here */
     if (current_thread->flags & THREAD_FLAG_DETACHED) {
+        printf("if: %s\n", current_thread->name);   // to check the flow of thread_exit
         /* remove it from the master thread list */
         list_delete(&current_thread->thread_list_node);
 
@@ -414,6 +425,7 @@ void thread_exit(int retcode) {
             heap_delayed_free(current_thread);
     } else {
         /* signal if anyone is waiting */
+        printf("else: %s\n", current_thread->name); // to check the flow of thread_exit
         wait_queue_wake_all(&current_thread->retcode_wait_queue, false, 0);
     }
 
@@ -423,6 +435,43 @@ void thread_exit(int retcode) {
     panic("somehow fell through thread_exit()\n");
 }
 
+/* modifies thread_exit_2 which accepts pointer of the target thread as a parameter.
+and performing only 'if' part*/
+
+void thread_exit_2(int retcode, thread_t *current_thread) {
+    // thread_t *current_thread = get_current_thread();
+
+    DEBUG_ASSERT(current_thread->magic == THREAD_MAGIC);
+    // DEBUG_ASSERT(current_thread->state == THREAD_RUNNING);
+    DEBUG_ASSERT(!thread_is_idle(current_thread));
+    THREAD_LOCK(state);
+
+    /* enter the dead state */
+    current_thread->state = THREAD_DEATH;
+    current_thread->retcode = retcode;
+
+        /* remove it from the master thread list */
+        list_delete(&current_thread->thread_list_node);
+        /* clear the structure's magic */
+        current_thread->magic = 0;
+        /* free its stack and the thread structure itself */
+        if (current_thread->flags & THREAD_FLAG_FREE_STACK && current_thread->stack) {
+            printf("448 if\n"); // to check the flow of thread_exit2
+            heap_delayed_free(current_thread->stack);
+            /* make sure its not going to get a bounds check performed on the half-freed stack */
+            current_thread->flags &= ~THREAD_FLAG_DEBUG_STACK_BOUNDS_CHECK;
+        }
+        if (current_thread->flags & THREAD_FLAG_FREE_STRUCT){
+            printf("454 if\n"); // to check the flow of thread_exit2
+            heap_delayed_free(current_thread);
+        }
+
+    /* reschedule */
+    thread_resched_2(current_thread);
+
+    panic("somehow fell through thread_exit()\n");
+}
+//////////////////////////////////////////////////////////////////////
 static void idle_thread_routine(void) {
     for (;;)
         arch_idle();
@@ -599,6 +648,149 @@ void thread_resched(void) {
     arch_context_switch(oldthread, newthread);
 }
 
+// modified thread_resched_2 which accepts and uses passed thread pointer
+void thread_resched_2(thread_t *current_thread) {
+    thread_t *oldthread;
+    thread_t *newthread;
+
+    //  thread_t *current_thread = get_current_thread();
+    uint cpu = arch_curr_cpu_num();
+
+    DEBUG_ASSERT(arch_ints_disabled());
+    DEBUG_ASSERT(spin_lock_held(&thread_lock));
+    DEBUG_ASSERT(current_thread->state != THREAD_RUNNING);
+
+    THREAD_STATS_INC(reschedules);
+    printf("33: %s\n", current_thread->name);
+    newthread = get_top_thread(cpu);
+    printf("535: %s\n", current_thread->name);
+    DEBUG_ASSERT(newthread);
+
+    newthread->state = THREAD_RUNNING;
+
+    oldthread = current_thread;
+
+    /* here the original idea was that not to reschdule the thread if
+    it is in the 'get_top_thread' top thread but returning at this point
+    will cause the threadexit2 go panic */
+    // if (newthread == oldthread){
+    //     printf("543 old is new\n");
+    //     return;}
+
+    /* set up quantum for the new thread if it was consumed */
+    if (newthread->remaining_quantum <= 0) {
+        printf("548 ");
+        newthread->remaining_quantum = 5; // XXX make this smarter
+    }
+
+    /* mark the cpu ownership of the threads */
+    printf("553 ");
+    thread_set_curr_cpu(oldthread, -1);printf("554 ");
+    thread_set_curr_cpu(newthread, cpu);printf("555 ");
+#if WITH_SMP
+    if (thread_is_idle(newthread)) {
+        mp_set_cpu_idle(cpu);
+    } else {
+        mp_set_cpu_busy(cpu);
+    }
+
+    if (thread_is_realtime(newthread)) {
+        mp_set_cpu_realtime(cpu);
+    } else {
+        mp_set_cpu_non_realtime(cpu);
+    }
+#endif
+printf("570 ");
+#if THREAD_STATS
+    THREAD_STATS_INC(context_switches);
+
+    lk_bigtime_t now = current_time_hires();
+    if (thread_is_idle(oldthread)) {
+        thread_stats[cpu].idle_time += now - thread_stats[cpu].last_idle_timestamp;
+    } else {
+        oldthread->stats.total_run_time += now - oldthread->stats.last_run_timestamp;
+    }
+    if (thread_is_idle(newthread)) {
+        thread_stats[cpu].last_idle_timestamp = now;
+    } else {
+        newthread->stats.last_run_timestamp = now;
+        newthread->stats.schedules++;
+    }
+#endif
+printf("587 ");
+    KEVLOG_THREAD_SWITCH(oldthread, newthread);
+
+#if PLATFORM_HAS_DYNAMIC_TIMER
+    if (thread_is_real_time_or_idle(newthread)) {
+        if (!thread_is_real_time_or_idle(oldthread)) {
+            /* if we're switching from a non real time to a real time, cancel
+             * the preemption timer. */
+#if DEBUG_THREAD_CONTEXT_SWITCH
+            dprintf(ALWAYS, "arch_context_switch: stop preempt, cpu %d, old %p (%s), new %p (%s)\n",
+                    cpu, oldthread, oldthread->name, newthread, newthread->name);
+#endif
+            timer_cancel(&preempt_timer[cpu]);
+        }
+    } else if (thread_is_real_time_or_idle(oldthread)) {
+        /* if we're switching from a real time (or idle thread) to a regular one,
+         * set up a periodic timer to run our preemption tick. */
+#if DEBUG_THREAD_CONTEXT_SWITCH
+        dprintf(ALWAYS, "arch_context_switch: start preempt, cpu %d, old %p (%s), new %p (%s)\n",
+                cpu, oldthread, oldthread->name, newthread, newthread->name);
+#endif
+        timer_set_periodic(&preempt_timer[cpu], 10, thread_timer_tick, NULL);
+    }
+#endif
+printf("611 ");
+    /* set some optional target debug leds */
+    target_set_debug_led(0, !thread_is_idle(newthread));
+
+    /* do the switch */
+    set_current_thread(newthread);
+printf("617 ");
+#if DEBUG_THREAD_CONTEXT_SWITCH
+    dprintf(ALWAYS, "arch_context_switch: cpu %d, old %p (%s, pri %d, flags 0x%x), new %p (%s, pri %d, flags 0x%x)\n",
+            cpu, oldthread, oldthread->name, oldthread->priority,
+            oldthread->flags, newthread, newthread->name,
+            newthread->priority, newthread->flags);
+#endif
+printf("624 ");
+#if THREAD_STACK_BOUNDS_CHECK
+    /* check that the old thread has not blown its stack just before pushing its context */
+    if (oldthread->flags & THREAD_FLAG_DEBUG_STACK_BOUNDS_CHECK) {
+        STATIC_ASSERT((THREAD_STACK_PADDING_SIZE % sizeof(uint32_t)) == 0);
+        uint32_t *s = (uint32_t *)oldthread->stack;
+        for (size_t i = 0; i < THREAD_STACK_PADDING_SIZE / sizeof(uint32_t); i++) {
+            if (unlikely(s[i] != STACK_DEBUG_WORD)) {
+                /* NOTE: will probably blow the stack harder here, but hopefully enough
+                 * state exists to at least get some sort of debugging done.
+                 */
+                panic("stack overrun at %p: thread %p (%s), stack %p\n", &s[i],
+                      oldthread, oldthread->name, oldthread->stack);
+            }
+        }
+    }
+#endif
+printf("641 ");
+#ifdef WITH_LIB_UTHREAD
+    uthread_context_switch(oldthread, newthread);
+#endif
+printf("645 ");
+#if WITH_KERNEL_VM
+    /* see if we need to swap mmu context */
+    if (newthread->aspace != oldthread->aspace) {
+        vmm_context_switch(oldthread->aspace, newthread->aspace);
+    }
+#endif
+printf("652 ");
+    /* do the low level context switch */
+    // if (strcmp(current_thread->name, "mockThread") == 0){
+    //     printf("\n655++");
+    // }
+    // else
+        arch_context_switch(oldthread, newthread);
+    printf("\n655 ");
+}
 /**
  * @brief Yield the cpu to another thread
  *
@@ -646,8 +838,8 @@ void thread_yield(void) {
  */
 void thread_preempt(void) {
     thread_t *current_thread = get_current_thread();
-
-    DEBUG_ASSERT(current_thread->magic == THREAD_MAGIC);
+    // printf("preempt %s\n", current_thread->name);
+    // DEBUG_ASSERT(current_thread->magic == THREAD_MAGIC);
     DEBUG_ASSERT(current_thread->state == THREAD_RUNNING);
 
 #if THREAD_STATS
@@ -1189,6 +1381,7 @@ int wait_queue_wake_one(wait_queue_t *wait, bool reschedule, status_t wait_queue
  *
  * @return  The number of threads woken (zero or one)
  */
+// wait_queue_wake_all(&current_thread->retcode_wait_queue, false, 0);
 int wait_queue_wake_all(wait_queue_t *wait, bool reschedule, status_t wait_queue_error) {
     thread_t *t;
     int ret = 0;
@@ -1205,6 +1398,7 @@ int wait_queue_wake_all(wait_queue_t *wait, bool reschedule, status_t wait_queue
          * of the run queue first, so that the newly awakened threads get a chance to run
          * before the current one, but the current one doesn't get unnecessarilly punished.
          */
+        printf("1211\n");
         current_thread->state = THREAD_READY;
         insert_in_run_queue_head(current_thread);
     }
@@ -1295,7 +1489,7 @@ status_t thread_unblock_from_wait_queue(thread_t *t, status_t wait_queue_error) 
 // It contains sufficient information for a remote debugger to walk
 // the thread list without needing the symbols and debug sections in
 // the elf binary for lk or the ability to parse them.
-const struct __debugger_info__ {
+const struct _debugger_info_ {
     u32 version; // flags:16 major:8 minor:8
     void *thread_list_ptr;
     void *current_thread_ptr;

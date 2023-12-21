@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <kernel/thread.h>
 #include <kernel/mutex.h>
+#include <lk/list.h>    // included list.h header file to use list_delete()
 #if WITH_LIB_ENV
 #include <lib/env.h>
 #endif
@@ -191,7 +192,7 @@ console_t *console_get_current(void) {
 
 console_t *console_set_current(console_t *con) {
     console_t *old = (console_t *)tls_get(TLS_ENTRY_CONSOLE);
-    tls_set(TLS_ENTRY_CONSOLE, (uintptr_t)con); 
+    tls_set(TLS_ENTRY_CONSOLE, (uintptr_t)con);
     LTRACEF("setting new %p, old %p\n", con, old);
 
     return old;
@@ -257,6 +258,39 @@ static const console_cmd *match_command(const char *command, const uint8_t avail
     return NULL;
 }
 
+// Global variables
+bool is_mockThread_running = false;
+volatile bool mockThread_should_exit = false;
+thread_t *mockThread = NULL;
+
+static int mockThread_entry(void *arg) {
+    // Thread's main execution code
+    while (!mockThread_should_exit) {
+        int i = 0;
+        while(i < 9999){
+        }
+    }
+    printf("killed the thread\n] ");
+    return 0;
+}
+
+// Function to create and start the mockThread
+void startMockThread(void) {
+    if (!is_mockThread_running) {
+        printf("mockThread created\n");
+        mockThread_should_exit = false;
+        mockThread = thread_create("mockThread", mockThread_entry, NULL, DEFAULT_PRIORITY, DEFAULT_STACK_SIZE);
+        if (mockThread != NULL) {
+            thread_resume(mockThread);
+            is_mockThread_running = true;
+        } else {
+            printf("Failed to create mockThread thread\n");
+        }
+    }
+    else
+        printf("mockThread is running already!\n] ");
+}
+
 static int read_debug_line(const char **outbuffer, void *cookie) {
     int pos = 0;
     int escape_level = 0;
@@ -289,6 +323,18 @@ static int read_debug_line(const char **outbuffer, void *cookie) {
                         pos--;
                         fputs("\b \b", stdout); // wipe out a character
                     }
+                    break;
+                case 0x3: // case for listening Ctrl+C and terminating the thread
+                    printf("Ctrl C pressed !\n");
+                    // check if thread is already running.
+                    if (is_mockThread_running) {
+                        mockThread_should_exit = true;
+                        is_mockThread_running = false;
+                        thread_exit_2(0, mockThread);
+                        printf("thread_kill initiated\n");
+                    }
+                    else
+                        printf("] ");
                     break;
 
                 case 0x1b: // escape
@@ -627,6 +673,10 @@ static status_t command_loop(console_t *con, int (*get_line)(const char **, void
 
         /* try to match the command */
         const console_cmd *command = match_command(args[0].str, CMD_AVAIL_NORMAL);
+        // create mockThread on entering keywords "mockT"
+        if (strcmp(args[0].str, "mockT") == 0) {
+            startMockThread();
+        }
         if (!command) {
             if (showprompt)
                 printf("command not found\n");

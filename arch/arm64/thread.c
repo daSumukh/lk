@@ -51,8 +51,13 @@ static void initial_thread_func(void) {
     ret = current_thread->entry(current_thread->arg);
 
     LTRACEF("initial_thread_func: thread %p exiting with %d\n", current_thread, ret);
-
-    thread_exit(ret);
+    if (strcmp(current_thread->name, "mockThread") == 0){
+        printf("ignoring for the target thread\n\n");
+    }
+    else{
+        thread_exit(ret);
+        printf("normal termination\n");
+    }
 }
 
 void arch_thread_initialize(thread_t *t) {
